@@ -163,8 +163,8 @@ export const Route = createFileRoute("/api/chat")({
                   } catch {}
                   let output: unknown;
                   try {
-                    if (name === "get_datetime") output = getDatetime(args.timezone as string | undefined);
-                    else if (name === "run_shell" && sandbox) output = await sandbox.run(String(args.command ?? ""));
+                    if (name === "get_datetime") output = getDatetime(args["timezone"] as string | undefined);
+                    else if (name === "run_shell" && sandbox) output = await sandbox.run(String(args["command"] ?? ""));
                     else output = { error: `Ismeretlen eszköz: ${name}` };
                   } catch (e) {
                     output = { error: e instanceof Error ? e.message : String(e) };
