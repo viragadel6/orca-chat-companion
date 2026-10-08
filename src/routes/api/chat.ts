@@ -1,4 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { readSseData } from "@/lib/chat-stream";
 
 const ORCAROUTER_URL = "https://api.orcarouter.ai/v1/chat/completions";
 const MODEL = "tencent/hy4-preview-free";
@@ -10,6 +11,7 @@ type ChatMessage = {
   content: unknown;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
+  reasoning_content?: string;
 };
 type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string } };
 
@@ -62,11 +64,12 @@ function getDatetime(tz?: string) {
 
 class Sandbox {
   private sessionId: string | null = null;
-  constructor(private apiKey: string) {}
+  constructor(private apiKey: string, private signal: AbortSignal) {}
 
   private async start() {
     const res = await fetch(`${INSTAVM_URL}/v1/sessions/session`, {
       method: "POST",
+      signal: this.signal,
       headers: { "Content-Type": "application/json", "X-API-Key": this.apiKey },
       body: JSON.stringify({ api_key: this.apiKey, vm_lifetime_seconds: 600 }),
     });
@@ -79,6 +82,7 @@ class Sandbox {
     if (!this.sessionId) await this.start();
     const res = await fetch(`${INSTAVM_URL}/execute`, {
       method: "POST",
+      signal: this.signal,
       headers: { "Content-Type": "application/json", "X-API-Key": this.apiKey },
       body: JSON.stringify({ command, language: "bash", session_id: this.sessionId, timeout: 120 }),
     });
@@ -116,19 +120,26 @@ export const Route = createFileRoute("/api/chat")({
           .slice(-60);
 
         const tools = instaKey ? TOOLS : TOOLS.filter((t) => t.function.name !== "run_shell");
-        const sandbox = instaKey ? new Sandbox(instaKey) : null;
+        const abort = new AbortController();
+        const onAbort = () => abort.abort();
+        request.signal.addEventListener("abort", onAbort, { once: true });
+        if (request.signal.aborted) abort.abort();
+        const sandbox = instaKey ? new Sandbox(instaKey, abort.signal) : null;
 
         const encoder = new TextEncoder();
         const stream = new ReadableStream({
           async start(controller) {
-            const send = (obj: unknown) =>
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+            const send = (obj: unknown) => {
+              if (!abort.signal.aborted) controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+            };
             try {
               for (let step = 0; step < MAX_STEPS; step++) {
+                if (abort.signal.aborted) break;
                 const upstream = await fetch(ORCAROUTER_URL, {
                   method: "POST",
+                  signal: abort.signal,
                   headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-                  body: JSON.stringify({ model: MODEL, messages, tools, stream: false }),
+                  body: JSON.stringify({ model: MODEL, messages, tools, stream: true }),
                 });
                 if (!upstream.ok) {
                   const detail = await upstream.text().catch(() => "");
@@ -141,22 +152,51 @@ export const Route = createFileRoute("/api/chat")({
                   send({ type: "error", message });
                   break;
                 }
-                const result = await upstream.json();
-                const msg = result?.choices?.[0]?.message ?? {};
-                const reasoning = msg.reasoning_content ?? msg.reasoning;
-                if (typeof reasoning === "string" && reasoning) send({ type: "delta", reasoning_content: reasoning });
-
-                const calls: ToolCall[] = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+                if (!upstream.body) throw new Error("A modell nem küldött streamet.");
+                let content = "";
+                let reasoning = "";
+                let finished = false;
+                const callParts = new Map<number, ToolCall>();
+                for await (const data of readSseData(upstream.body)) {
+                  if (data === "[DONE]") { finished = true; break; }
+                  const chunk = JSON.parse(data);
+                  if (chunk.error) throw new Error(chunk.error.message || "A modell streamelése megszakadt.");
+                  const choice = chunk.choices?.[0];
+                  const delta = choice?.delta;
+                  if (choice?.finish_reason) finished = true;
+                  if (!delta) continue;
+                  const thought = delta.reasoning_content ?? delta.reasoning;
+                  if (typeof thought === "string" && thought) {
+                    reasoning += thought;
+                    send({ type: "delta", reasoning_content: thought });
+                  }
+                  if (typeof delta.content === "string" && delta.content) {
+                    content += delta.content;
+                    send({ type: "delta", content: delta.content });
+                  }
+                  for (const part of delta.tool_calls ?? []) {
+                    const index = part.index ?? 0;
+                    const call = callParts.get(index) ?? { id: "", type: "function" as const, function: { name: "", arguments: "" } };
+                    if (part.id) call.id = part.id;
+                    if (part.function?.name) call.function.name += part.function.name;
+                    if (part.function?.arguments) call.function.arguments += part.function.arguments;
+                    callParts.set(index, call);
+                  }
+                }
+                if (abort.signal.aborted) break;
+                if (!finished) throw new Error("A modell streamelése idő előtt megszakadt.");
+                const calls = [...callParts.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
                 if (calls.length === 0) {
-                  send({ type: "delta", content: typeof msg.content === "string" ? msg.content : "" });
                   send({ type: "done" });
                   break;
                 }
 
-                messages.push({ role: "assistant", content: msg.content ?? "", tool_calls: calls });
+                messages.push({ role: "assistant", content, reasoning_content: reasoning, tool_calls: calls });
                 for (const call of calls) {
+                  if (abort.signal.aborted) break;
+                  if (!call.id || !call.function.name) throw new Error("Hiányos eszközhívás érkezett.");
                   const name = call.function?.name;
-                  send({ type: "agent_event", event: { type: "tool_start", tool: name } });
+                  send({ type: "agent_event", event: { type: "tool_start", tool: name, call_id: call.id, input: call.function.arguments } });
                   let args: Record<string, unknown> = {};
                   try {
                     args = JSON.parse(call.function?.arguments || "{}");
@@ -169,11 +209,13 @@ export const Route = createFileRoute("/api/chat")({
                   } catch (e) {
                     output = { error: e instanceof Error ? e.message : String(e) };
                   }
-                  send({ type: "agent_event", event: { type: "tool_result", tool: name } });
+                  const serializedOutput = JSON.stringify(output).slice(0, 12000);
+                  const failed = typeof output === "object" && output !== null && "error" in output;
+                  send({ type: "agent_event", event: { type: "tool_result", tool: name, call_id: call.id, output: serializedOutput, status: failed ? "error" : "completed" } });
                   messages.push({
                     role: "tool",
                     tool_call_id: call.id,
-                    content: JSON.stringify(output).slice(0, 12000),
+                    content: serializedOutput,
                   });
                 }
                 if (step === MAX_STEPS - 1) {
@@ -183,10 +225,15 @@ export const Route = createFileRoute("/api/chat")({
               }
             } catch (e) {
               send({ type: "error", message: e instanceof Error ? e.message : "Hiba történt." });
+            } finally {
+              request.signal.removeEventListener("abort", onAbort);
+              if (!abort.signal.aborted) {
+                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                controller.close();
+              }
             }
-            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-            controller.close();
           },
+          cancel() { abort.abort(); },
         });
 
         return new Response(stream, {
