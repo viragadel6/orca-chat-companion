@@ -396,6 +396,10 @@ textarea{ border-radius: 0; }
   padding: 0 12px 11px; color: var(--fg2); font-size: 13px; line-height: 1.55;
   white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
 }
+.cot-tools{padding:0 12px 11px;color:var(--fg2);font-size:13px;overflow-wrap:anywhere;position:relative;z-index:1;}
+.cot-tool{border-top:1px solid var(--sep);padding:8px 0;}
+.cot-tool summary{cursor:pointer;}
+.cot-tool pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:240px;overflow:auto;font-size:12px;}
 
 .md p{ margin: 0 0 8px; }
 .md p:last-child{ margin-bottom: 0; }
@@ -6591,6 +6595,8 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
 
   function toolDisplayName(name){
     var labels = {
+      run_shell:"shell-parancs",
+      get_datetime:"dátum és idő",
       sandbox_execute:"shell-parancs",
       sandbox_read_file:"fájlolvasás",
       sandbox_write_file:"fájlírás",
@@ -6623,7 +6629,32 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
     message.activeToolCall = {name:String(tool || "művelet")};
   }
 
+  function recordToolEvent(message, event){
+    if(!Array.isArray(message.toolExecutions)) message.toolExecutions = [];
+    var id = event.call_id;
+    var entry = message.toolExecutions.find(function(item){ return id ? item.id === id : item.name === event.tool && item.status === "running"; });
+    if(!entry){
+      entry = {id:id || String(Date.now()) + "-" + message.toolExecutions.length, name:event.tool, status:"running"};
+      message.toolExecutions.push(entry);
+    }
+    if(event.input != null) entry.input = event.input;
+    if(event.output != null) entry.output = event.output;
+    if(event.type === "tool_result") entry.status = event.status || "completed";
+    if(!message.thinkingManual && event.type === "tool_start") message.thinkingOpen = true;
+  }
+
+  function renderCotTools(message){
+    if(!Array.isArray(message.toolExecutions) || !message.toolExecutions.length) return "";
+    return '<div class="cot-tools">' + message.toolExecutions.map(function(item){
+      var status = item.status === "running" ? "Fut…" : item.status === "error" ? "Hiba" : item.status === "stopped" ? "Megszakítva" : "Kész";
+      return '<details class="cot-tool"><summary>' + escapeHtml(toolDisplayName(item.name)) + ' · ' + status + '</summary>' +
+        (item.input ? '<pre>' + escapeHtml(String(item.input)) + '</pre>' : '') +
+        (item.output ? '<pre>' + escapeHtml(String(item.output)) + '</pre>' : '') + '</details>';
+    }).join("") + '</div>';
+  }
+
   function clearToolActivity(message, tool){
+    if(message && !tool && Array.isArray(message.toolExecutions)) message.toolExecutions.forEach(function(item){ if(item.status === "running") item.status = "stopped"; });
     if(!message || !message.activeToolCall) return;
     var activeName = String(message.activeToolCall.name || "");
     if(!tool || !activeName || activeName === String(tool)) message.activeToolCall = null;
@@ -6852,8 +6883,9 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
         return '<div class="msg-group u" role="listitem">' + renderMessageImages(display.images, messageIndex, false) + renderTextFiles(display.textFiles, messageIndex) + textBubble + '<div class="msg-actions"><button type="button" class="msg-edit" data-edit-index="' + messageIndex + '">Szerkesztés</button></div>' + branchNav + '</div>';
       }
       var thinking = parsed.thinking;
-      var thinkingHtml = thinking ? '<details class="thinking lg cot-glass" data-thinking-index="' + messageIndex + '"' + (message.thinkingOpen ? ' open' : '') + '><summary>Reasoning</summary><div class="thinking-text">' + escapeHtml(thinking) + '</div></details>' : '';
-      var toolActivity = renderToolActivity(message);
+      var cotTools = renderCotTools(message);
+      var thinkingHtml = thinking || cotTools ? '<details class="thinking lg cot-glass" data-thinking-index="' + messageIndex + '"' + (message.thinkingOpen ? ' open' : '') + '><summary>Reasoning' + (cotTools ? ' · Eszközök' : '') + '</summary><div class="thinking-text">' + escapeHtml(thinking) + '</div>' + cotTools + '</details>' : '';
+      var toolActivity = cotTools ? '' : renderToolActivity(message);
       var pending = message.imageRequestPending ? '<div class="image-request-pending">' + (message.imageOperation === "edit" ? "A kép szerkesztése folyamatban…" : "A kép létrehozása folyamatban…") + '</div>' : '';
       var body = message.isError ? '<div class="err-bbl">' + markdown(display.text) + '</div>' : '<div class="ai-bubble md">' + markdown(display.text) + '</div>';
       var hasEarlierUser = messages.slice(0, messageIndex).some(function(item){ return item.role === "user"; });
@@ -8200,8 +8232,9 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
      if(!group){ render(); return; }
      var parsed = splitAssistantMessage({content:message.content, reasoning_content:message.thinking});
      var details = group.querySelector(".thinking");
-      if(!!parsed.thinking !== !!details){ render(); return; }
-      var toolActivityHtml = renderToolActivity(message);
+       var cotTools = renderCotTools(message);
+       if(!!(parsed.thinking || cotTools) !== !!details){ render(); return; }
+       var toolActivityHtml = cotTools ? '' : renderToolActivity(message);
       var toolActivity = group.querySelector(".tool-call-indicator");
       if(!!toolActivityHtml !== !!toolActivity){ render(); return; }
       if(toolActivityHtml && toolActivity){
@@ -8376,12 +8409,14 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
             var agentEvent = event.event || {};
             var eventType = agentEvent.type || "agent_event";
             if(eventType === "tool_start"){
+                recordToolEvent(streamingMessage, agentEvent);
                setToolActivity(streamingMessage, agentEvent.tool);
                persistCurrent();
                render();
               return;
              }
              if(eventType === "tool_result"){
+                recordToolEvent(streamingMessage, agentEvent);
                clearToolActivity(streamingMessage, agentEvent.tool);
                persistCurrent();
                render();
@@ -8656,12 +8691,14 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
       var agentEvent = event.event || {};
       var type = agentEvent.type || "agent_event";
       if(type === "tool_start"){
+        recordToolEvent(message, agentEvent);
         setToolActivity(message, agentEvent.tool);
         persistCurrent();
         render();
         return;
       }
       if(type === "tool_result"){
+        recordToolEvent(message, agentEvent);
         clearToolActivity(message, agentEvent.tool);
         persistCurrent();
         render();
