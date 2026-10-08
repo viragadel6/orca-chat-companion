@@ -33,10 +33,13 @@ const TOOLS = [
     type: "function",
     function: {
       name: "get_datetime",
-      description: "Get the current date and time. Optionally in a given IANA timezone (e.g. Europe/Budapest).",
+      description:
+        "Get the current date and time. Optionally in a given IANA timezone (e.g. Europe/Budapest).",
       parameters: {
         type: "object",
-        properties: { timezone: { type: "string", description: "IANA timezone, default Europe/Budapest" } },
+        properties: {
+          timezone: { type: "string", description: "IANA timezone, default Europe/Budapest" },
+        },
       },
     },
   },
@@ -64,7 +67,10 @@ function getDatetime(tz?: string) {
 
 class Sandbox {
   private sessionId: string | null = null;
-  constructor(private apiKey: string, private signal: AbortSignal) {}
+  constructor(
+    private apiKey: string,
+    private signal: AbortSignal,
+  ) {}
 
   private async start() {
     const res = await fetch(`${INSTAVM_URL}/v1/sessions/session`, {
@@ -115,7 +121,10 @@ export const Route = createFileRoute("/api/chat")({
         }
 
         const messages: ChatMessage[] = body.messages
-          .filter((m) => m && typeof m.role === "string" && ["system", "user", "assistant"].includes(m.role))
+          .filter(
+            (m) =>
+              m && typeof m.role === "string" && ["system", "user", "assistant"].includes(m.role),
+          )
           .map((m) => ({ role: m.role, content: m.content }))
           .slice(-60);
 
@@ -130,7 +139,8 @@ export const Route = createFileRoute("/api/chat")({
         const stream = new ReadableStream({
           async start(controller) {
             const send = (obj: unknown) => {
-              if (!abort.signal.aborted) controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+              if (!abort.signal.aborted)
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
             };
             try {
               for (let step = 0; step < MAX_STEPS; step++) {
@@ -138,7 +148,10 @@ export const Route = createFileRoute("/api/chat")({
                 const upstream = await fetch(ORCAROUTER_URL, {
                   method: "POST",
                   signal: abort.signal,
-                  headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+                  headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${apiKey}`,
+                  },
                   body: JSON.stringify({ model: MODEL, messages, tools, stream: true }),
                 });
                 if (!upstream.ok) {
@@ -158,9 +171,13 @@ export const Route = createFileRoute("/api/chat")({
                 let finished = false;
                 const callParts = new Map<number, ToolCall>();
                 for await (const data of readSseData(upstream.body)) {
-                  if (data === "[DONE]") { finished = true; break; }
+                  if (data === "[DONE]") {
+                    finished = true;
+                    break;
+                  }
                   const chunk = JSON.parse(data);
-                  if (chunk.error) throw new Error(chunk.error.message || "A modell streamelése megszakadt.");
+                  if (chunk.error)
+                    throw new Error(chunk.error.message || "A modell streamelése megszakadt.");
                   const choice = chunk.choices?.[0];
                   const delta = choice?.delta;
                   if (choice?.finish_reason) finished = true;
@@ -176,42 +193,74 @@ export const Route = createFileRoute("/api/chat")({
                   }
                   for (const part of delta.tool_calls ?? []) {
                     const index = part.index ?? 0;
-                    const call = callParts.get(index) ?? { id: "", type: "function" as const, function: { name: "", arguments: "" } };
+                    const call = callParts.get(index) ?? {
+                      id: "",
+                      type: "function" as const,
+                      function: { name: "", arguments: "" },
+                    };
                     if (part.id) call.id = part.id;
                     if (part.function?.name) call.function.name += part.function.name;
-                    if (part.function?.arguments) call.function.arguments += part.function.arguments;
+                    if (part.function?.arguments)
+                      call.function.arguments += part.function.arguments;
                     callParts.set(index, call);
                   }
                 }
                 if (abort.signal.aborted) break;
                 if (!finished) throw new Error("A modell streamelése idő előtt megszakadt.");
-                const calls = [...callParts.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
+                const calls = [...callParts.entries()]
+                  .sort(([a], [b]) => a - b)
+                  .map(([, call]) => call);
                 if (calls.length === 0) {
                   send({ type: "done" });
                   break;
                 }
 
-                messages.push({ role: "assistant", content, reasoning_content: reasoning, tool_calls: calls });
+                messages.push({
+                  role: "assistant",
+                  content,
+                  reasoning_content: reasoning,
+                  tool_calls: calls,
+                });
                 for (const call of calls) {
                   if (abort.signal.aborted) break;
-                  if (!call.id || !call.function.name) throw new Error("Hiányos eszközhívás érkezett.");
+                  if (!call.id || !call.function.name)
+                    throw new Error("Hiányos eszközhívás érkezett.");
                   const name = call.function?.name;
-                  send({ type: "agent_event", event: { type: "tool_start", tool: name, call_id: call.id, input: call.function.arguments } });
+                  send({
+                    type: "agent_event",
+                    event: {
+                      type: "tool_start",
+                      tool: name,
+                      call_id: call.id,
+                      input: call.function.arguments,
+                    },
+                  });
                   let args: Record<string, unknown> = {};
                   try {
                     args = JSON.parse(call.function?.arguments || "{}");
                   } catch {}
                   let output: unknown;
                   try {
-                    if (name === "get_datetime") output = getDatetime(args["timezone"] as string | undefined);
-                    else if (name === "run_shell" && sandbox) output = await sandbox.run(String(args["command"] ?? ""));
+                    if (name === "get_datetime")
+                      output = getDatetime(args["timezone"] as string | undefined);
+                    else if (name === "run_shell" && sandbox)
+                      output = await sandbox.run(String(args["command"] ?? ""));
                     else output = { error: `Ismeretlen eszköz: ${name}` };
                   } catch (e) {
                     output = { error: e instanceof Error ? e.message : String(e) };
                   }
                   const serializedOutput = JSON.stringify(output).slice(0, 12000);
                   const failed = typeof output === "object" && output !== null && "error" in output;
-                  send({ type: "agent_event", event: { type: "tool_result", tool: name, call_id: call.id, output: serializedOutput, status: failed ? "error" : "completed" } });
+                  send({
+                    type: "agent_event",
+                    event: {
+                      type: "tool_result",
+                      tool: name,
+                      call_id: call.id,
+                      output: serializedOutput,
+                      status: failed ? "error" : "completed",
+                    },
+                  });
                   messages.push({
                     role: "tool",
                     tool_call_id: call.id,
@@ -233,7 +282,9 @@ export const Route = createFileRoute("/api/chat")({
               }
             }
           },
-          cancel() { abort.abort(); },
+          cancel() {
+            abort.abort();
+          },
         });
 
         return new Response(stream, {
