@@ -238,7 +238,9 @@ export const Route = createFileRoute("/api/chat")({
                   let args: Record<string, unknown> = {};
                   try {
                     args = JSON.parse(call.function?.arguments || "{}");
-                  } catch {}
+                  } catch {
+                    // Invalid arguments are handled as a failed tool invocation below.
+                  }
                   let output: unknown;
                   try {
                     if (name === "get_datetime")
