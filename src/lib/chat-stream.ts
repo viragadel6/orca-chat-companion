@@ -1,4 +1,11 @@
-/** Decode SSE incrementally, including UTF-8 and frames split across network reads. */
+function extractData(frame: string) {
+  return frame
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n");
+}
+
 export async function* readSseData(body: ReadableStream<Uint8Array>) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -11,19 +18,11 @@ export async function* readSseData(body: ReadableStream<Uint8Array>) {
       while ((match = /\r?\n\r?\n/.exec(buffer))) {
         const frame = buffer.slice(0, match.index);
         buffer = buffer.slice(match.index + match[0].length);
-        const data = frame
-          .split(/\r?\n/)
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice(5).trimStart())
-          .join("\n");
+        const data = extractData(frame);
         if (data) yield data;
       }
       if (done) {
-        const data = buffer
-          .split(/\r?\n/)
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice(5).trimStart())
-          .join("\n");
+        const data = extractData(buffer);
         if (data) yield data;
         break;
       }
