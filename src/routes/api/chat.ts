@@ -4,7 +4,14 @@ import { readSseData } from "@/lib/chat-stream";
 const ORCAROUTER_URL = "https://api.orcarouter.ai/v1/chat/completions";
 const MODEL = "tencent/hy4-preview-free";
 const INSTAVM_URL = "https://api.instavm.io";
-const MAX_STEPS = 8;
+const MAX_STEPS = 600;
+const MAX_RUNTIME_MS = 6 * 60 * 60 * 1000;
+const VM_LIFETIME_SECONDS = 6 * 60 * 60 + 900;
+const HEARTBEAT_MS = 15000;
+const CONTEXT_CHAR_BUDGET = 350000;
+const KEEP_RECENT_TOOL_RESULTS = 12;
+const TOOL_OUTPUT_LIMIT = 12000;
+const UPSTREAM_RETRIES = 5;
 
 type ChatMessage = {
   role: string;
@@ -23,12 +30,12 @@ const TOOLS = [
     function: {
       name: "run_shell",
       description:
-        "Run a bash command in a persistent sandboxed Debian Linux VM (sudo, internet access). Files, installed packages and state persist across calls in this chat request. Nix-installed binaries are on PATH automatically.",
+        "Run a bash command in a persistent sandboxed Debian Linux VM (sudo, internet access). Files, installed packages and state persist for the whole task. Nix-installed binaries are on PATH automatically. For long-running processes start them in the background with nohup and poll their logs.",
       parameters: {
         type: "object",
         properties: {
           command: shellProp("Bash command to execute"),
-          timeout: { type: "number", description: "Seconds, default 120, max 300" },
+          timeout: { type: "number", description: "Seconds, default 180, max 1800" },
         },
         required: ["command"],
       },
@@ -41,7 +48,10 @@ const TOOLS = [
       description: "Execute Python 3 code in the sandbox VM and return stdout/stderr.",
       parameters: {
         type: "object",
-        properties: { code: shellProp("Python source code") },
+        properties: {
+          code: shellProp("Python source code"),
+          timeout: { type: "number", description: "Seconds, default 180, max 1800" },
+        },
         required: ["code"],
       },
     },
@@ -81,10 +91,13 @@ const TOOLS = [
     type: "function",
     function: {
       name: "read_file",
-      description: "Read a text file from the sandbox VM (first 20000 characters).",
+      description: "Read a text file from the sandbox VM, optionally starting at a byte offset (20000 characters per call).",
       parameters: {
         type: "object",
-        properties: { path: shellProp("File path") },
+        properties: {
+          path: shellProp("File path"),
+          offset: { type: "number", description: "Byte offset, default 0" },
+        },
         required: ["path"],
       },
     },
@@ -115,6 +128,19 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "update_plan",
+      description:
+        "Record or revise the task plan and progress. Use it at the start of long tasks and whenever a milestone is reached so progress stays visible and survives context trimming.",
+      parameters: {
+        type: "object",
+        properties: { plan: shellProp("Full current plan with done/pending markers and key findings") },
+        required: ["plan"],
+      },
+    },
+  },
 ];
 
 function jsonError(message: string, status: number) {
@@ -128,7 +154,11 @@ function systemPrompt() {
   return [
     `Aktuális időpont: ${fmt("Europe/Budapest")} (Europe/Budapest). UTC: ${now.toISOString()}. Unix: ${Math.floor(now.getTime() / 1000)}.`,
     "Ezt az időt tekintsd pontosnak; ne kérdezd le eszközzel.",
-    "Rendelkezésedre áll egy izolált Linux VM (InstaVM) eszközökön keresztül: shell, Python, fájlírás/olvasás, Nix-alapú csomagtelepítés bármely nyelvhez, porttovábbítás nyilvános URL-re és valódi böngésző. Ha kód futtatása vagy ellenőrzése segít, használd őket.",
+    "Autonóm ügynök vagy, amely akár több órán át önállóan dolgozik egy feladaton, amíg az teljesen kész és ellenőrzött nem lesz.",
+    "Rendelkezésedre áll egy izolált Linux VM (InstaVM) eszközökön keresztül: shell, Python, fájlírás/olvasás, Nix-alapú csomagtelepítés bármely nyelvhez, porttovábbítás nyilvános URL-re és valódi böngésző.",
+    "Munkamódszer: hosszabb feladatnál először készíts tervet az update_plan eszközzel, majd lépésenként hajtsd végre, minden eredményt futtatással ellenőrizz, hibánál diagnosztizálj és javíts, mérföldköveknél frissítsd a tervet.",
+    "Ne kérdezz vissza, ne állj meg félúton, ne adj ki egyszerűsített, mock vagy helykitöltő megoldást. Csak akkor fejezd be eszközhívás nélküli válasszal, ha a feladat ténylegesen elkészült, és ekkor foglald össze az eredményt.",
+    "Hosszan futó folyamatokat nohup-pal háttérben indíts, és a naplóikat lekérdezve kövesd őket.",
   ].join("\n");
 }
 
@@ -142,6 +172,19 @@ function b64(text: string) {
   return btoa(bin);
 }
 const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+const sleep = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        resolve();
+      },
+      { once: true },
+    );
+  });
 
 class Sandbox {
   private sessionId: string | null = null;
@@ -171,7 +214,7 @@ class Sandbox {
     if (!this.sessionId) {
       const data = await this.api("/v1/sessions/session", {
         api_key: this.apiKey,
-        vm_lifetime_seconds: 900,
+        vm_lifetime_seconds: VM_LIFETIME_SECONDS,
       });
       if (!data.session_id) throw new Error("Sandbox indítása sikertelen");
       this.sessionId = data.session_id as string;
@@ -179,9 +222,9 @@ class Sandbox {
     return this.sessionId;
   }
 
-  async exec(command: string, language: "bash" | "python" = "bash", timeout = 120) {
+  async exec(command: string, language: "bash" | "python" = "bash", timeout = 180) {
     const session_id = await this.session();
-    const t = Math.min(Math.max(timeout, 5), 300);
+    const t = Math.min(Math.max(timeout, 5), 1800);
     return this.api("/execute", {
       command: language === "bash" ? NIX_PATH_PREFIX + command : command,
       language,
@@ -197,7 +240,7 @@ class Sandbox {
     return this.exec(
       `${NIX_BOOTSTRAP}; nix --extra-experimental-features 'nix-command flakes' profile add ${refs} 2>&1 | tail -15 && echo "Telepítve: ${clean.join(", ")}"`,
       "bash",
-      300,
+      900,
     );
   }
 
@@ -207,8 +250,9 @@ class Sandbox {
     );
   }
 
-  readFile(path: string) {
-    return this.exec(`head -c 20000 ${q(path)}`);
+  readFile(path: string, offset: number) {
+    const start = Math.max(0, Math.floor(offset)) + 1;
+    return this.exec(`tail -c +${start} ${q(path)} | head -c 20000`);
   }
 
   async exposePort(port: number) {
@@ -244,25 +288,57 @@ class Sandbox {
 }
 
 async function runTool(sandbox: Sandbox | null, name: string, args: Record<string, unknown>) {
+  if (name === "update_plan") return { ok: true, plan: String(args["plan"] ?? "") };
   if (!sandbox) return { error: "A sandbox nincs beállítva." };
   const str = (k: string) => String(args[k] ?? "");
   switch (name) {
     case "run_shell":
-      return sandbox.exec(str("command"), "bash", Number(args["timeout"]) || 120);
+      return sandbox.exec(str("command"), "bash", Number(args["timeout"]) || 180);
     case "run_python":
-      return sandbox.exec(str("code"), "python");
+      return sandbox.exec(str("code"), "python", Number(args["timeout"]) || 180);
     case "install_packages":
       return sandbox.install(Array.isArray(args["packages"]) ? args["packages"].map(String) : []);
     case "write_file":
       return sandbox.writeFile(str("path"), str("content"));
     case "read_file":
-      return sandbox.readFile(str("path"));
+      return sandbox.readFile(str("path"), Number(args["offset"]) || 0);
     case "expose_port":
       return sandbox.exposePort(Number(args["port"]));
     case "browse_url":
       return sandbox.browse(str("url"));
     default:
       return { error: `Ismeretlen eszköz: ${name}` };
+  }
+}
+
+function messageSize(m: ChatMessage) {
+  return (
+    (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content ?? "").length) +
+    (m.reasoning_content?.length ?? 0) +
+    (m.tool_calls ? JSON.stringify(m.tool_calls).length : 0)
+  );
+}
+
+function compactContext(messages: ChatMessage[]) {
+  let total = messages.reduce((sum, m) => sum + messageSize(m), 0);
+  if (total <= CONTEXT_CHAR_BUDGET) return;
+  const toolIndexes = messages.map((m, i) => (m.role === "tool" ? i : -1)).filter((i) => i >= 0);
+  const compactable = toolIndexes.slice(0, Math.max(0, toolIndexes.length - KEEP_RECENT_TOOL_RESULTS));
+  for (const i of compactable) {
+    if (total <= CONTEXT_CHAR_BUDGET) break;
+    const m = messages[i]!;
+    const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+    if (text.length <= 600) continue;
+    const next = `${text.slice(0, 300)} …[régi kimenet tömörítve]… ${text.slice(-200)}`;
+    total -= text.length - next.length;
+    m.content = next;
+  }
+  for (const m of messages) {
+    if (total <= CONTEXT_CHAR_BUDGET) break;
+    if (m.role === "assistant" && m.reasoning_content && m.reasoning_content.length > 400) {
+      total -= m.reasoning_content.length;
+      m.reasoning_content = "";
+    }
   }
 }
 
@@ -293,43 +369,67 @@ export const Route = createFileRoute("/api/chat")({
           .slice(-60);
         messages.unshift({ role: "system", content: systemPrompt() });
 
-        const tools = instaKey ? TOOLS : undefined;
+        const tools = instaKey ? TOOLS : TOOLS.filter((t) => t.function.name === "update_plan");
         const abort = new AbortController();
         const onAbort = () => abort.abort();
         request.signal.addEventListener("abort", onAbort, { once: true });
         if (request.signal.aborted) abort.abort();
         const sandbox = instaKey ? new Sandbox(instaKey, abort.signal) : null;
+        const startedAt = Date.now();
 
         const encoder = new TextEncoder();
         const stream = new ReadableStream({
           async start(controller) {
-            const send = (obj: unknown) => {
-              if (!abort.signal.aborted)
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+            const write = (text: string) => {
+              if (abort.signal.aborted) return;
+              try {
+                controller.enqueue(encoder.encode(text));
+              } catch {
+                abort.abort();
+              }
             };
-            try {
-              for (let step = 0; step < MAX_STEPS; step++) {
-                if (abort.signal.aborted) break;
-                const upstream = await fetch(ORCAROUTER_URL, {
+            const send = (obj: unknown) => write(`data: ${JSON.stringify(obj)}\n\n`);
+            const heartbeat = setInterval(() => write(": keepalive\n\n"), HEARTBEAT_MS);
+
+            const callModel = async () => {
+              for (let attempt = 0; ; attempt++) {
+                const res = await fetch(ORCAROUTER_URL, {
                   method: "POST",
                   signal: abort.signal,
                   headers: {
                     "Content-Type": "application/json",
                     Authorization: `Bearer ${apiKey}`,
                   },
-                  body: JSON.stringify({ model: MODEL, messages, ...(tools ? { tools } : {}), stream: true }),
+                  body: JSON.stringify({ model: MODEL, messages, tools, stream: true }),
                 });
-                if (!upstream.ok) {
-                  const detail = await upstream.text().catch(() => "");
-                  let message = "A modell nem válaszolt.";
-                  try {
-                    message = JSON.parse(detail)?.error?.message || message;
-                  } catch {
-                    if (detail) message = detail.slice(0, 300);
-                  }
-                  send({ type: "error", message });
+                if (res.ok) return res;
+                const detail = await res.text().catch(() => "");
+                const retryable = res.status === 429 || res.status >= 500;
+                if (retryable && attempt < UPSTREAM_RETRIES && !abort.signal.aborted) {
+                  await sleep(Math.min(60000, 2000 * 2 ** attempt), abort.signal);
+                  continue;
+                }
+                let message = "A modell nem válaszolt.";
+                try {
+                  message = JSON.parse(detail)?.error?.message || message;
+                } catch {
+                  if (detail) message = detail.slice(0, 300);
+                }
+                throw new Error(message);
+              }
+            };
+
+            try {
+              let step = 0;
+              for (; step < MAX_STEPS; step++) {
+                if (abort.signal.aborted) break;
+                if (Date.now() - startedAt > MAX_RUNTIME_MS) {
+                  send({ type: "delta", content: "\n\n_(Elértem a maximális futásidőt.)_" });
+                  send({ type: "done" });
                   break;
                 }
+                compactContext(messages);
+                const upstream = await callModel();
                 if (!upstream.body) throw new Error("A modell nem küldött streamet.");
                 let content = "";
                 let reasoning = "";
@@ -374,7 +474,7 @@ export const Route = createFileRoute("/api/chat")({
                 if (!finished) throw new Error("A modell streamelése idő előtt megszakadt.");
                 const calls = [...callParts.entries()]
                   .sort(([a], [b]) => a - b)
-                  .map(([, call]) => call);
+                  .map(([, call], i) => ({ ...call, id: call.id || `call_${step}_${i}` }));
                 if (calls.length === 0) {
                   send({ type: "done" });
                   break;
@@ -388,9 +488,7 @@ export const Route = createFileRoute("/api/chat")({
                 });
                 for (const call of calls) {
                   if (abort.signal.aborted) break;
-                  if (!call.id || !call.function.name)
-                    throw new Error("Hiányos eszközhívás érkezett.");
-                  const name = call.function?.name;
+                  const name = call.function.name;
                   send({
                     type: "agent_event",
                     event: {
@@ -400,19 +498,26 @@ export const Route = createFileRoute("/api/chat")({
                       input: call.function.arguments,
                     },
                   });
-                  let args: Record<string, unknown> = {};
-                  try {
-                    args = JSON.parse(call.function?.arguments || "{}");
-                  } catch {
-                    // Invalid arguments are handled as a failed tool invocation below.
-                  }
                   let output: unknown;
+                  let args: Record<string, unknown> | null = null;
                   try {
-                    output = await runTool(sandbox, name, args);
-                  } catch (e) {
-                    output = { error: e instanceof Error ? e.message : String(e) };
+                    args = JSON.parse(call.function.arguments || "{}");
+                  } catch {
+                    output = { error: "Érvénytelen JSON argumentumok az eszközhívásban." };
                   }
-                  const serializedOutput = JSON.stringify(output).slice(0, 12000);
+                  if (!name) output = { error: "Hiányzó eszköznév." };
+                  if (output === undefined && args) {
+                    try {
+                      output = await runTool(sandbox, name, args);
+                    } catch (e) {
+                      output = { error: e instanceof Error ? e.message : String(e) };
+                    }
+                  }
+                  const full = JSON.stringify(output) ?? "null";
+                  const serializedOutput =
+                    full.length > TOOL_OUTPUT_LIMIT
+                      ? `${full.slice(0, TOOL_OUTPUT_LIMIT - 2000)} …[kimenet csonkolva, ${full.length} karakter]… ${full.slice(-1800)}`
+                      : full;
                   const failed = typeof output === "object" && output !== null && "error" in output;
                   send({
                     type: "agent_event",
@@ -430,19 +535,25 @@ export const Route = createFileRoute("/api/chat")({
                     content: serializedOutput,
                   });
                 }
-                if (step === MAX_STEPS - 1) {
-                  send({ type: "delta", content: "_(Elértem a lépésszám-korlátot.)_" });
-                  send({ type: "done" });
-                }
+              }
+              if (step >= MAX_STEPS) {
+                send({ type: "delta", content: "\n\n_(Elértem a lépésszám-korlátot.)_" });
+                send({ type: "done" });
               }
             } catch (e) {
-              send({ type: "error", message: e instanceof Error ? e.message : "Hiba történt." });
+              if (!abort.signal.aborted)
+                send({ type: "error", message: e instanceof Error ? e.message : "Hiba történt." });
             } finally {
+              clearInterval(heartbeat);
               request.signal.removeEventListener("abort", onAbort);
               await sandbox?.close();
               if (!abort.signal.aborted) {
-                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                controller.close();
+                write("data: [DONE]\n\n");
+                try {
+                  controller.close();
+                } catch {
+                  abort.abort();
+                }
               }
             }
           },
@@ -455,6 +566,7 @@ export const Route = createFileRoute("/api/chat")({
           headers: {
             "Content-Type": "text/event-stream; charset=utf-8",
             "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
           },
         });
       },
