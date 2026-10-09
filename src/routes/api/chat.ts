@@ -156,7 +156,7 @@ class Sandbox {
       method,
       signal: this.signal,
       headers: { "Content-Type": "application/json", "X-API-Key": this.apiKey },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     const text = await res.text();
     if (!res.ok) throw new Error(`InstaVM HTTP ${res.status}: ${text.slice(0, 1000)}`);
